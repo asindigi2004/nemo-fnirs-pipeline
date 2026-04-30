@@ -160,7 +160,7 @@ See `requirements.txt`. Key versions:
 If you use this pipeline, please cite:
 
 **This pipeline:**
-> Sindigi, A. (2026). *NEMO fNIRS frontal sensitivity validation pipeline* [Software]. GitHub. https://github.com/YOUR_USERNAME/nemo-fnirs-pipeline
+> Sindigi, A. (2026). *NEMO fNIRS frontal sensitivity validation pipeline* [Software]. GitHub. https://github.com/asindigi2004/nemo-fnirs-pipeline
 
 **NEMO dataset (required):**
 > Spapé, M., Mäkelä, K., & Ruotsalo, T. (2024). NEMO: A database for emotion analysis using functional near-infrared spectroscopy. *IEEE Transactions on Affective Computing*, 15(3), 1166–1178. https://doi.org/10.1109/TAFFC.2023.3315971
