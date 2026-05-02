@@ -1,16 +1,14 @@
-# NEMO fNIRS pipeline — Python dependencies
+# NEMO fNIRS pipeline — pinned dependencies
 # Install with: pip install -r requirements.txt
-# Requires Python 3.9+
+# Python 3.9+ required. Tested on 3.10 and 3.11.
+#
+# scipy >= 1.11 is required for scipy.stats.false_discovery_control.
+# The pipeline includes a manual BH fallback for scipy < 1.11,
+# but pinning >= 1.11 ensures the native implementation is used.
 
-# Core scientific stack
-numpy>=1.23
-pandas>=1.5
-scipy>=1.11        # false_discovery_control added in 1.11; older versions use manual BH fallback
-matplotlib>=3.6
-
-# fNIRS / neuroimaging
-mne>=1.0           # artinis-brite23 montage required
-
-# Excel reading (for fOLD 10-10.xls)
-openpyxl>=3.0
-xlrd>=2.0          # legacy .xls support
+mne>=1.4.0
+scipy>=1.11.0
+numpy>=1.24.0
+pandas>=1.5.0
+matplotlib>=3.6.0
+openpyxl>=3.0.10
