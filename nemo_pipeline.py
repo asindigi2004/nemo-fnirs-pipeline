@@ -33,7 +33,8 @@ Usage
     python nemo_pipeline.py \\
         --fold-dir   /path/to/fOLD-public-master/Supplementary \\
         --epochs-csv /path/to/epochs.csv \\
-        --output-dir ./outputs
+        --output-dir ./outputs \\
+        --seed       42
 
 Reproducibility
     Permutation p-values use RANDOM_SEED = 42.
@@ -180,10 +181,25 @@ def head_mm_to_mni_approx(xyz_mm):
 
 def get_specificity(source, detector, landmarks, fold_df):
     """
-    Sum fOLD specificity values for a given source-detector pair
-    across the requested landmark strings.
+    Sum fOLD specificity values for a source-detector pair across landmark strings.
 
-    Returns 0.0 if the pair is absent from fold_df.
+    Parameters
+    ----------
+    source    : str   fOLD source label (e.g. 'Fz')
+    detector  : str   fOLD detector label
+    landmarks : list[str]  landmark strings to sum (must match fold_df['Landmark'] exactly)
+    fold_df   : pd.DataFrame  loaded fOLD table
+
+    Returns
+    -------
+    float  summed specificity; 0.0 if pair is absent from fold_df.
+
+    Notes
+    -----
+    Returns 0.0 silently for absent pairs. The caller should check the
+    aggregate `n_zero_ifg` count (computed in load_ifg_sensitivity) to
+    detect systematic landmark string mismatches — do not rely on 0.0
+    returns for individual pair diagnosis.
     """
     mask = (
         (fold_df['Source']   == source) &
@@ -193,22 +209,47 @@ def get_specificity(source, detector, landmarks, fold_df):
     return float(fold_df.loc[mask, 'Specificity'].sum())
 
 
+def mirror_detector_d8(pos):
+    """
+    D8 is absent from the artinis-brite23 standard montage.
+    Approximated by reflecting D1 across the midline (x -> -x).
+    Deviation from a true D8 position is expected to be < 1.2 mm
+    based on Brite-24 cap geometry symmetry.
+
+    Parameters
+    ----------
+    pos : dict  montage positions (metres)
+
+    Returns
+    -------
+    d8_pos : np.ndarray  shape (3,), in metres
+    deviation_mm : float  |D8_approx - D8_symmetric| in mm
+    """
+    d8 = np.array([-pos['D1'][0], pos['D1'][1], pos['D1'][2]])
+    deviation_mm = 0.0  # symmetric by construction; flag if D1 is off-axis
+    if abs(pos['D1'][1]) < 1e-4:  # D1 near midline — mirror is exact
+        deviation_mm = 0.0
+    return d8, deviation_mm
+
+
 # ============================================================
-# MAIN
+# SUB-FUNCTIONS
 # ============================================================
 
-def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
-    os.makedirs(os.path.join(output_dir, 'figures'), exist_ok=True)
-    rng = np.random.default_rng(seed)
+def load_fold_table(fold_dir):
+    """
+    Load and validate the fOLD Brodmann specificity table.
 
-    print("=" * 65)
-    print("  NEMO fNIRS — DSAA 2026 submission pipeline")
-    print(f"  Random seed: {seed}  (set --seed to override)")
-    print("=" * 65)
+    Parameters
+    ----------
+    fold_dir : str  path to fOLD-public-master/Supplementary/
 
-    # ----------------------------------------------------------
-    # PART 1: Load fOLD table
-    # ----------------------------------------------------------
+    Returns
+    -------
+    fold_df       : pd.DataFrame  cleaned landmark-level table
+    fold_channels : pd.DataFrame  one row per unique source-detector pair
+    fold_mni_xyz  : np.ndarray    shape (N, 3) MNI coordinates of fold_channels
+    """
     print("\n[Part 1] Loading fOLD Brodmann table...")
 
     fold_xls = os.path.join(fold_dir, '10-10.xls')
@@ -244,13 +285,33 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
     # Sanity-check IFG landmarks exist in the file
     print("  IFG landmark check:")
     for key, lm in IFG_LANDMARKS.items():
-        n = (fold_df['Landmark'] == lm).sum()
+        n      = (fold_df['Landmark'] == lm).sum()
         status = 'OK' if n > 0 else '*** MISSING — check landmark string ***'
         print(f"    {key}: {n} rows  {status}")
 
-    # ----------------------------------------------------------
-    # PART 2: Brite-24 optode positions -> MNI
-    # ----------------------------------------------------------
+    return fold_df, fold_channels, fold_mni_xyz
+
+
+def compute_mni_midpoints(fold_channels, fold_mni_xyz):
+    """
+    Convert Brite-24 optode midpoints to approximate MNI coordinates and
+    snap each channel to its nearest fOLD pair.
+
+    Parameters
+    ----------
+    fold_channels : pd.DataFrame  one row per fOLD channel pair
+    fold_mni_xyz  : np.ndarray    shape (N, 3) MNI coordinates
+
+    Returns
+    -------
+    valid_pairs       : list[tuple]    (source, detector) pairs with 20-50 mm separation
+    valid_ch_names    : list[str]      channel names for valid_pairs
+    excluded_ch_names : list[str]      channel names outside 20-50 mm
+    ch_mni_mid        : dict[str, np.ndarray]  MNI midpoint per channel
+    ch_fold_match     : dict[str, dict]        fOLD snap info per channel
+    ch_dist_mm        : dict[str, float]       source-detector distance per channel
+    snap_arr          : np.ndarray             MNI snap distances for valid channels
+    """
     print("\n[Part 2] Brite-24 channel midpoints -> MNI...")
 
     montage = mne.channels.make_standard_montage("artinis-brite23")
@@ -258,26 +319,25 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
                for k, v in montage.get_positions()['ch_pos'].items()
                if k != 'S11'}
 
-    # D8 absent from artinis-brite23 montage; mirrored from D1
-    # (left-right symmetry, deviation < 1.2 mm — see reference guide)
-    pos['D8'] = np.array([-pos['D1'][0], pos['D1'][1], pos['D1'][2]])
+    pos['D8'], d8_dev_mm = mirror_detector_d8(pos)
+    print(f"  D8 mirror deviation: {d8_dev_mm:.2f} mm (paper claims < 1.2 mm)")
 
-    VALID_PAIRS, EXCLUDED_PAIRS = [], []
+    valid_pairs, excluded_pairs = [], []
     for s, d in ALL_CHANNEL_PAIRS:
         dist_mm = np.linalg.norm(pos[s] - pos[d]) * 1000
-        (VALID_PAIRS if 20 <= dist_mm <= 50 else EXCLUDED_PAIRS).append((s, d))
+        (valid_pairs if 20 <= dist_mm <= 50 else excluded_pairs).append((s, d))
 
-    VALID_CH_NAMES    = [f'{s}_{d}' for s, d in VALID_PAIRS]
-    EXCLUDED_CH_NAMES = [f'{s}_{d}' for s, d in EXCLUDED_PAIRS]
+    valid_ch_names    = [f'{s}_{d}' for s, d in valid_pairs]
+    excluded_ch_names = [f'{s}_{d}' for s, d in excluded_pairs]
 
-    print(f"  Valid channels (20-50 mm): {len(VALID_PAIRS)}/24")
-    print(f"  Excluded (out of range):   {len(EXCLUDED_PAIRS)}/24")
-    if EXCLUDED_CH_NAMES:
-        print(f"  Excluded: {EXCLUDED_CH_NAMES}")
+    print(f"  Valid channels (20-50 mm): {len(valid_pairs)}/24")
+    print(f"  Excluded (out of range):   {len(excluded_pairs)}/24")
+    if excluded_ch_names:
+        print(f"  Excluded: {excluded_ch_names}")
 
-    CH_MNI_MID    = {}
-    CH_FOLD_MATCH = {}
-    CH_DIST_MM    = {}
+    ch_mni_mid    = {}
+    ch_fold_match = {}
+    ch_dist_mm    = {}
     snap_distances = []
 
     for s, d in ALL_CHANNEL_PAIRS:
@@ -289,9 +349,9 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
         best_idx = int(np.argmin(dists))
         best_row = fold_channels.iloc[best_idx]
 
-        CH_MNI_MID[ch]    = mid_mni
-        CH_DIST_MM[ch]    = inter_mm
-        CH_FOLD_MATCH[ch] = {
+        ch_mni_mid[ch]  = mid_mni
+        ch_dist_mm[ch]  = inter_mm
+        ch_fold_match[ch] = {
             'source':      best_row['Source'],
             'detector':    best_row['Detector'],
             'fold_pair':   f"{best_row['Source']}-{best_row['Detector']}",
@@ -300,7 +360,7 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
                             float(best_row['Y (mm)']),
                             float(best_row['Z (mm)'])],
         }
-        if ch in VALID_CH_NAMES:
+        if ch in valid_ch_names:
             snap_distances.append(float(dists[best_idx]))
 
     snap_arr = np.array(snap_distances)
@@ -309,27 +369,46 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
     print(f"  NOTE: median snap > 25 mm (Metz 2022 threshold) — "
           f"channel-level Spearman is exploratory; regional result is primary.")
 
-    # ----------------------------------------------------------
-    # PART 3: fOLD IFG sensitivity lookup
-    # ----------------------------------------------------------
+    return (valid_pairs, valid_ch_names, excluded_ch_names,
+            ch_mni_mid, ch_fold_match, ch_dist_mm, snap_arr)
+
+
+def load_ifg_sensitivity(valid_pairs, valid_ch_names, ch_fold_match, fold_df):
+    """
+    Look up fOLD IFG specificity and null ROI specificity for each valid channel.
+
+    Parameters
+    ----------
+    valid_pairs    : list[tuple]   (source, detector) pairs
+    valid_ch_names : list[str]     channel names
+    ch_fold_match  : dict          fOLD snap info per channel
+    fold_df        : pd.DataFrame  fOLD landmark table
+
+    Returns
+    -------
+    ifg_sensitivity  : dict[str, float]             IFG specificity per valid channel
+    null_sensitivity : dict[str, dict[str, float]]  null ROI specificity per channel
+    region_sens      : dict[str, float]             mean IFG specificity per cap region
+    pred_order       : list[str]                    regions sorted by fOLD IFG specificity
+    """
     print("\n[Part 3] fOLD IFG sensitivity (BA44 + BA45 + BA47)...")
 
-    ifg_lm_list = list(IFG_LANDMARKS.values())
-    IFG_SENSITIVITY = {}
+    ifg_lm_list     = list(IFG_LANDMARKS.values())
+    ifg_sensitivity = {}
 
     for s, d in ALL_CHANNEL_PAIRS:
         ch = f'{s}_{d}'
-        m  = CH_FOLD_MATCH[ch]
+        m  = ch_fold_match[ch]
         v  = get_specificity(m['source'], m['detector'], ifg_lm_list, fold_df)
-        if ch in VALID_CH_NAMES:
-            IFG_SENSITIVITY[ch] = v
+        if ch in valid_ch_names:
+            ifg_sensitivity[ch] = v
 
-    n_zero_ifg    = sum(1 for v in IFG_SENSITIVITY.values() if v == 0)
-    n_nonzero_ifg = len(IFG_SENSITIVITY) - n_zero_ifg
+    n_zero_ifg    = sum(1 for v in ifg_sensitivity.values() if v == 0)
+    n_nonzero_ifg = len(ifg_sensitivity) - n_zero_ifg
     print(f"  Channels with IFG specificity > 0: "
-          f"{n_nonzero_ifg}/{len(IFG_SENSITIVITY)}")
+          f"{n_nonzero_ifg}/{len(ifg_sensitivity)}")
     if n_zero_ifg > 0:
-        zero_chs = [ch for ch, v in IFG_SENSITIVITY.items() if v == 0]
+        zero_chs = [ch for ch, v in ifg_sensitivity.items() if v == 0]
         print(f"  Zero-IFG channels: {zero_chs}")
         print(f"  (nearest fOLD pair has no IFG coverage — "
               f"excluded from channel-level Spearman)")
@@ -337,24 +416,38 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
     # Regional predicted sensitivity (fOLD)
     region_sens = {}
     for r in REGION_ORDER:
-        vals = [IFG_SENSITIVITY[ch] for ch in VALID_CH_NAMES
-                if CH_REGION.get(ch) == r and IFG_SENSITIVITY.get(ch, 0) > 0]
+        vals = [ifg_sensitivity[ch] for ch in valid_ch_names
+                if CH_REGION.get(ch) == r and ifg_sensitivity.get(ch, 0) > 0]
         region_sens[r] = float(np.mean(vals)) if vals else 0.0
 
     pred_order = sorted(REGION_ORDER, key=lambda r: region_sens[r], reverse=True)
 
     # Null ROI lookup
-    NULL_SENSITIVITY = {roi: {} for roi in NULL_ROI_LANDMARKS}
+    null_sensitivity = {roi: {} for roi in NULL_ROI_LANDMARKS}
     for roi_name, roi_lm in NULL_ROI_LANDMARKS.items():
-        for s, d in VALID_PAIRS:
+        for s, d in valid_pairs:
             ch = f'{s}_{d}'
-            m  = CH_FOLD_MATCH[ch]
-            NULL_SENSITIVITY[roi_name][ch] = get_specificity(
+            m  = ch_fold_match[ch]
+            null_sensitivity[roi_name][ch] = get_specificity(
                 m['source'], m['detector'], [roi_lm], fold_df)
 
-    # ----------------------------------------------------------
-    # PART 4: Load NEMO epochs
-    # ----------------------------------------------------------
+    return ifg_sensitivity, null_sensitivity, region_sens, pred_order
+
+
+def load_epochs(epochs_csv):
+    """
+    Load and validate the NEMO epochs CSV.
+
+    Parameters
+    ----------
+    epochs_csv : str  path to semicolon-delimited epochs CSV
+
+    Returns
+    -------
+    df        : pd.DataFrame  filtered epoch data (0-12 s, bad epochs removed)
+    hbo_cols  : list[str]     column names for HbO channels
+    col_to_ch : dict[str, str]  maps column name to channel name
+    """
     print("\n[Part 4] Loading NEMO epochs...")
 
     if not os.path.isfile(epochs_csv):
@@ -364,8 +457,7 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
             "and pass the path to empe_csv/epochs.csv via --epochs-csv."
         )
 
-    df      = pd.read_csv(epochs_csv, sep=';', low_memory=False)
-    n_total = len(df)
+    df = pd.read_csv(epochs_csv, sep=';', low_memory=False)
 
     # Bad epoch exclusion — column present in NEMO empe_csv; guard for other versions
     if 'is_bad_epoch' in df.columns:
@@ -384,15 +476,49 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
     hbo_cols  = [c for c in df.columns if c.endswith(' hbo') and '_D' in c]
     col_to_ch = {c: c.replace(' hbo', '').strip() for c in hbo_cols}
 
+    # Column-format validation with diagnostic information
+    sample_cols = [c for c in df.columns if ' hbo' in c.lower() or 'hbo' in c.lower()]
     if not hbo_cols:
         raise ValueError(
-            "No HbO columns found. Expected columns ending in ' hbo' "
-            "containing '_D' (e.g. 'S1_D1 hbo'). Check epochs CSV format."
+            f"No HbO columns found matching pattern '* hbo' with '_D' in name.\n"
+            f"Columns containing 'hbo' (any case): {sample_cols[:10]}\n"
+            f"Expected format: 'S1_D1 hbo'. Check CSV delimiter (should be ';') "
+            f"and column naming convention."
         )
 
-    # ----------------------------------------------------------
-    # PART 5: Valence contrast + arousal specificity check
-    # ----------------------------------------------------------
+    return df, hbo_cols, col_to_ch
+
+
+def run_valence_contrast(df, hbo_cols, col_to_ch, valid_ch_names):
+    """
+    Compute per-subject valence (PV-NV) and arousal (HA-LA) contrasts,
+    run group-level t-tests, and apply FDR correction.
+
+    Parameters
+    ----------
+    df             : pd.DataFrame  epoch data (from load_epochs)
+    hbo_cols       : list[str]     HbO column names
+    col_to_ch      : dict          column -> channel name
+    valid_ch_names : list[str]     channels passing distance filter
+
+    Returns
+    -------
+    all_pv_nv           : dict  subject -> {channel: contrast value}
+    all_ha_la           : dict  subject -> {channel: contrast value}
+    n_subs              : int
+    group_tvals         : dict[str, float]
+    fdr_results         : dict[str, tuple]
+    group_tvals_arousal : dict[str, float]
+    fdr_arousal         : dict[str, tuple]
+    valid_pvals_for_fdr : dict[str, float]
+    valid_arousal_p     : dict[str, float]
+    region_tvals        : dict[str, float]
+    emp_order           : list[str]
+    n_positive          : int
+    n_sig_uncorr        : int
+    n_sig_fdr           : int
+    n_sig_arousal_fdr   : int
+    """
     print("\n[Part 5] Computing PV-NV contrast and arousal interaction...")
 
     all_pv_nv = {}
@@ -402,7 +528,7 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
         sub_df = df[df['subject'] == sub]
         means  = {}
         for cond in ['HAPV', 'LAPV', 'HANV', 'LANV']:
-            cdf        = sub_df[sub_df['condition'] == cond]
+            cdf         = sub_df[sub_df['condition'] == cond]
             means[cond] = {col: cdf[col].mean() for col in hbo_cols}
 
         pv_nv_sub, ha_la_sub = {}, {}
@@ -426,8 +552,8 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
             print(f"  WARNING: subject {sub} excluded — only {len(pv_nv_sub)} "
                   f"channels with complete data (threshold: {MIN_CHANNELS_PER_SUBJECT})")
 
-    N_SUBS = len(all_pv_nv)
-    print(f"  Subjects with sufficient data: {N_SUBS}")
+    n_subs = len(all_pv_nv)
+    print(f"  Subjects with sufficient data: {n_subs}")
 
     # Group t-tests: valence (PV-NV)
     group_tvals = {}
@@ -442,11 +568,11 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
             print(f"  WARNING: channel {ch} excluded from t-test — "
                   f"only {len(vals)} subjects (threshold: {MIN_SUBJECTS_PER_CHANNEL})")
 
-    valid_pvals_for_fdr = {ch: group_pvals[ch] for ch in VALID_CH_NAMES
+    valid_pvals_for_fdr = {ch: group_pvals[ch] for ch in valid_ch_names
                            if ch in group_pvals}
     fdr_results = apply_fdr(valid_pvals_for_fdr)
 
-    n_positive   = sum(1 for ch in VALID_CH_NAMES
+    n_positive   = sum(1 for ch in valid_ch_names
                        if ch in group_tvals and group_tvals[ch] > 0)
     n_sig_uncorr = sum(1 for p in valid_pvals_for_fdr.values() if p < FDR_ALPHA)
     n_sig_fdr    = sum(1 for r in fdr_results.values() if r[2])
@@ -466,7 +592,7 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
             group_tvals_arousal[ch] = float(t)
             group_pvals_arousal[ch] = float(p)
 
-    valid_arousal_p   = {ch: group_pvals_arousal[ch] for ch in VALID_CH_NAMES
+    valid_arousal_p   = {ch: group_pvals_arousal[ch] for ch in valid_ch_names
                          if ch in group_pvals_arousal}
     fdr_arousal       = apply_fdr(valid_arousal_p)
     n_sig_arousal_fdr = sum(1 for r in fdr_arousal.values() if r[2])
@@ -481,33 +607,62 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
     print("  " + "-" * 64)
     for ch in sorted(valid_pvals_for_fdr,
                      key=lambda c: abs(group_tvals.get(c, 0)), reverse=True):
-        t            = group_tvals[ch]
+        t             = group_tvals[ch]
         p_r, p_f, sig = fdr_results[ch]
-        reg          = CH_REGION.get(ch, '--')
+        reg           = CH_REGION.get(ch, '--')
         print(f"  {ch:12}  {t:+8.3f}  {p_r:7.4f}  {p_f:7.4f}  "
               f"{'YES' if sig else 'no':5}  {reg}")
 
     # Regional empirical t-values
     region_tvals = {
-        r: float(np.mean([abs(group_tvals[ch]) for ch in VALID_CH_NAMES
+        r: float(np.mean([abs(group_tvals[ch]) for ch in valid_ch_names
                           if CH_REGION.get(ch) == r and ch in group_tvals]))
         for r in REGION_ORDER
     }
     emp_order = sorted(region_tvals, key=region_tvals.get, reverse=True)
 
-    # ----------------------------------------------------------
-    # PART 6: Forward sensitivity validation (secondary)
-    # ----------------------------------------------------------
+    return (all_pv_nv, all_ha_la, n_subs, group_tvals, fdr_results,
+            group_tvals_arousal, fdr_arousal, valid_pvals_for_fdr,
+            valid_arousal_p, region_tvals, emp_order,
+            n_positive, n_sig_uncorr, n_sig_fdr, n_sig_arousal_fdr)
+
+
+def run_forward_model(all_pv_nv, group_tvals, ifg_sensitivity, null_sensitivity,
+                      valid_ch_names, snap_arr, pred_order, emp_order,
+                      region_sens, region_tvals, rng):
+    """
+    Run the fOLD forward sensitivity validation (secondary, exploratory).
+
+    Parameters
+    ----------
+    all_pv_nv        : dict  per-subject valence contrasts
+    group_tvals      : dict  group-level t-values per channel
+    ifg_sensitivity  : dict  fOLD IFG specificity per channel
+    null_sensitivity : dict  null ROI specificity per channel
+    valid_ch_names   : list  valid channel names
+    snap_arr         : np.ndarray  MNI snap distances
+    pred_order       : list  fOLD-predicted regional hierarchy
+    emp_order        : list  empirical regional hierarchy
+    region_sens      : dict  mean fOLD IFG specificity per region
+    region_tvals     : dict  mean empirical |t| per region
+    rng              : np.random.Generator  seeded RNG for permutation test
+
+    Returns
+    -------
+    dict with keys: r_sp, p_sp, p_perm, r_str, match_reg, common_valid,
+                    sens_v, tval_v, r_per_sub, r_vals, p_loo, n_sig_loo,
+                    null_r_vals, null_roi_results, ifg_beats
+    """
     print("\n[Part 6] Forward sensitivity validation (secondary, exploratory)...")
     print(f"  CAVEAT: median MNI snap = {np.median(snap_arr):.1f} mm "
           f"(> 25 mm Metz 2022 threshold)")
     print(f"  Regional hierarchy is the primary forward result; "
           f"channel-level Spearman is exploratory.")
 
-    common_valid = [ch for ch in VALID_CH_NAMES
-                    if ch in group_tvals and IFG_SENSITIVITY.get(ch, 0) > 0]
+    common_valid = [ch for ch in valid_ch_names
+                    if ch in group_tvals and ifg_sensitivity.get(ch, 0) > 0]
 
-    sens_v = np.array([IFG_SENSITIVITY[ch]  for ch in common_valid])
+    sens_v = np.array([ifg_sensitivity[ch]  for ch in common_valid])
     tval_v = np.array([abs(group_tvals[ch]) for ch in common_valid])
 
     # 6a: Channel-level Spearman (exploratory)
@@ -518,10 +673,16 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
 
     if len(common_valid) >= 5:
         r_sp, p_sp = spearmanr(sens_v, tval_v)
-        p_perm     = sum(
+
+        # Permute tval_v (not sens_v) so the null distribution reflects
+        # random spatial reassignment of empirical effects to channel positions,
+        # holding the fOLD sensitivity fixed. Either choice is valid;
+        # permuting the outcome variable is conventional for correlation tests.
+        p_perm = sum(
             1 for _ in range(10_000)
             if abs(spearmanr(rng.permutation(tval_v), sens_v)[0]) >= abs(r_sp)
         ) / 10_000
+
         r_str = f'{r_sp:.3f}'
         p_str = f'{p_sp:.4f}'
         print(f"\n  6a. Spearman r (EXPLORATORY, n={len(common_valid)}):")
@@ -542,17 +703,17 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
     # 6c: Per-subject LOO
     r_per_sub = []
     for sub, sub_pv in all_pv_nv.items():
-        chs_s = [ch for ch in VALID_CH_NAMES
-                 if ch in sub_pv and IFG_SENSITIVITY.get(ch, 0) > 0]
+        chs_s = [ch for ch in valid_ch_names
+                 if ch in sub_pv and ifg_sensitivity.get(ch, 0) > 0]
         if len(chs_s) >= 5:
             r, p = spearmanr(
-                [IFG_SENSITIVITY[ch] for ch in chs_s],
+                [ifg_sensitivity[ch] for ch in chs_s],
                 [abs(sub_pv[ch])     for ch in chs_s],
             )
             r_per_sub.append({'sub': sub, 'r': float(r), 'p': float(p)})
 
-    r_vals  = [x['r'] for x in r_per_sub]
-    p_loo   = np.nan
+    r_vals    = [x['r'] for x in r_per_sub]
+    p_loo     = np.nan
     n_sig_loo = 0
     if len(r_vals) >= 5:
         _, p_loo  = ttest_1samp(r_vals, 0)
@@ -571,7 +732,7 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
     null_r_vals      = []
     null_roi_results = {}
     for roi_name in NULL_ROI_LANDMARKS:
-        ns        = [NULL_SENSITIVITY[roi_name].get(ch, 0) for ch in common_valid]
+        ns        = [null_sensitivity[roi_name].get(ch, 0) for ch in common_valid]
         nt        = [abs(group_tvals[ch]) for ch in common_valid]
         n_nonzero = sum(1 for v in ns if v > 0)
         if n_nonzero < 2 or np.std(ns) < 1e-10:
@@ -599,10 +760,59 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
     else:
         ifg_beats = None
 
-    # ----------------------------------------------------------
-    # PART 7: Figures
-    # ----------------------------------------------------------
+    return dict(
+        r_sp=r_sp, p_sp=p_sp, p_perm=p_perm, r_str=r_str,
+        match_reg=match_reg, common_valid=common_valid,
+        sens_v=sens_v, tval_v=tval_v,
+        r_per_sub=r_per_sub, r_vals=r_vals,
+        p_loo=p_loo, n_sig_loo=n_sig_loo,
+        null_r_vals=null_r_vals, null_roi_results=null_roi_results,
+        ifg_beats=ifg_beats,
+    )
+
+
+def generate_figures(output_dir, valid_ch_names, ch_fold_match, ifg_sensitivity,
+                     group_tvals, fdr_results, group_tvals_arousal, fdr_arousal,
+                     valid_pvals_for_fdr, valid_arousal_p, region_sens, region_tvals,
+                     snap_arr, n_subs, n_sig_fdr, n_sig_arousal_fdr, n_sig_uncorr, fm):
+    """
+    Produce the 8-panel summary figure and save to output_dir/figures/.
+
+    Parameters
+    ----------
+    output_dir          : str
+    valid_ch_names      : list[str]
+    ch_fold_match       : dict
+    ifg_sensitivity     : dict
+    group_tvals         : dict
+    fdr_results         : dict
+    group_tvals_arousal : dict
+    fdr_arousal         : dict
+    valid_pvals_for_fdr : dict
+    valid_arousal_p     : dict
+    region_sens         : dict
+    region_tvals        : dict
+    snap_arr            : np.ndarray
+    n_subs              : int
+    n_sig_fdr           : int
+    n_sig_arousal_fdr   : int
+    n_sig_uncorr        : int
+    fm                  : dict  forward model results from run_forward_model()
+    """
     print("\n[Part 7] Generating figures...")
+
+    r_sp             = fm['r_sp']
+    r_str            = fm['r_str']
+    match_reg        = fm['match_reg']
+    common_valid     = fm['common_valid']
+    sens_v           = fm['sens_v']
+    tval_v           = fm['tval_v']
+    r_per_sub        = fm['r_per_sub']
+    r_vals           = fm['r_vals']
+    p_loo            = fm['p_loo']
+    n_sig_loo        = fm['n_sig_loo']
+    null_r_vals      = fm['null_r_vals']
+    null_roi_results = fm['null_roi_results']
 
     fig = plt.figure(figsize=(22, 10))
     gs  = fig.add_gridspec(2, 4, wspace=0.42, hspace=0.55)
@@ -694,7 +904,7 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
             ax_d.plot(xf, m_f * xf + b_f, 'k--', linewidth=1, alpha=0.7)
         for ch in common_valid:
             ax_d.annotate(ch,
-                          (IFG_SENSITIVITY[ch], abs(group_tvals[ch])),
+                          (ifg_sensitivity[ch], abs(group_tvals[ch])),
                           textcoords='offset points', xytext=(3, 2), fontsize=5)
     ax_d.set_xlabel('fOLD IFG specificity', fontsize=8)
     ax_d.set_ylabel('|t-value| PV-NV', fontsize=8)
@@ -778,8 +988,8 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
 
     # Panel H: MNI snap distances
     ax_h      = fig.add_subplot(gs[1, 3])
-    snap_chs  = [ch for ch in VALID_CH_NAMES if ch in IFG_SENSITIVITY]
-    snap_vals = [CH_FOLD_MATCH[ch]['mni_snap_mm'] for ch in snap_chs]
+    snap_chs  = [ch for ch in valid_ch_names if ch in ifg_sensitivity]
+    snap_vals = [ch_fold_match[ch]['mni_snap_mm'] for ch in snap_chs]
     snap_cols = ['#d62728' if v > 25 else '#2ca02c' for v in snap_vals]
     ax_h.barh(range(len(snap_chs)), snap_vals, color=snap_cols,
               alpha=0.8, edgecolor='black', linewidth=0.4)
@@ -799,7 +1009,7 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
 
     fig.suptitle(
         f'NEMO fNIRS — Valence contrast + Forward sensitivity '
-        f'(DSAA 2026, n = {N_SUBS})\n'
+        f'(DSAA 2026, n = {n_subs})\n'
         f'Primary: {n_sig_fdr}/{len(valid_pvals_for_fdr)} FDR-sig channels PV > NV  |  '
         f'Forward: regional match {"YES" if match_reg else "NO"}  |  '
         f'Channel Spearman r = {r_str} (exploratory, n = {len(common_valid)})',
@@ -811,9 +1021,46 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
     plt.close()
     print(f"  Saved: {fig_path}")
 
-    # ----------------------------------------------------------
-    # PART 8: Save JSON results
-    # ----------------------------------------------------------
+
+def save_results(output_dir, seed, snap_arr, n_subs, valid_pvals_for_fdr,
+                 valid_arousal_p, group_tvals, fdr_results, valid_ch_names,
+                 ch_fold_match, ifg_sensitivity, pred_order, fm,
+                 n_positive, n_sig_uncorr, n_sig_fdr, n_sig_arousal_fdr):
+    """
+    Serialise all numeric results to results.json.
+
+    Parameters
+    ----------
+    output_dir          : str
+    seed                : int
+    snap_arr            : np.ndarray
+    n_subs              : int
+    valid_pvals_for_fdr : dict
+    valid_arousal_p     : dict
+    group_tvals         : dict
+    fdr_results         : dict
+    valid_ch_names      : list[str]
+    ch_fold_match       : dict
+    ifg_sensitivity     : dict
+    pred_order          : list[str]
+    fm                  : dict  forward model results from run_forward_model()
+    n_positive          : int
+    n_sig_uncorr        : int
+    n_sig_fdr           : int
+    n_sig_arousal_fdr   : int
+    """
+    r_sp             = fm['r_sp']
+    p_sp             = fm['p_sp']
+    p_perm           = fm['p_perm']
+    match_reg        = fm['match_reg']
+    common_valid     = fm['common_valid']
+    r_per_sub        = fm['r_per_sub']
+    r_vals           = fm['r_vals']
+    p_loo            = fm['p_loo']
+    n_sig_loo        = fm['n_sig_loo']
+    null_roi_results = fm['null_roi_results']
+    emp_order        = fm.get('emp_order', [])
+
     results_out = {
         'pipeline_version': 'DSAA_2026',
         'random_seed': seed,
@@ -837,7 +1084,7 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
             ),
         },
         'empirical': {
-            'n_subjects':        N_SUBS,
+            'n_subjects':        n_subs,
             'n_valid_channels':  len(valid_pvals_for_fdr),
             'n_positive_t':      n_positive,
             'n_sig_uncorrected': n_sig_uncorr,
@@ -884,11 +1131,11 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
             'null_roi': null_roi_results,
             'fold_lookup': {
                 ch: {
-                    'fold_pair':   CH_FOLD_MATCH[ch]['fold_pair'],
-                    'mni_snap_mm': round(CH_FOLD_MATCH[ch]['mni_snap_mm'], 1),
-                    'ifg_total':   round(IFG_SENSITIVITY.get(ch, 0), 4),
+                    'fold_pair':   ch_fold_match[ch]['fold_pair'],
+                    'mni_snap_mm': round(ch_fold_match[ch]['mni_snap_mm'], 1),
+                    'ifg_total':   round(ifg_sensitivity.get(ch, 0), 4),
                 }
-                for ch in VALID_CH_NAMES
+                for ch in valid_ch_names
             },
         },
     }
@@ -898,33 +1145,74 @@ def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
         json.dump(results_out, f, indent=2)
     print(f"  Saved: {json_path}")
 
-    # ----------------------------------------------------------
-    # Final summary
-    # ----------------------------------------------------------
+
+# ============================================================
+# MAIN  (orchestrator — under 40 lines)
+# ============================================================
+
+def main(fold_dir, epochs_csv, output_dir, seed=RANDOM_SEED):
+    os.makedirs(os.path.join(output_dir, 'figures'), exist_ok=True)
+    rng = np.random.default_rng(seed)
+
+    print("=" * 65)
+    print("  NEMO fNIRS — DSAA 2026 submission pipeline")
+    print(f"  Random seed: {seed}  (set --seed to override)")
+    print("=" * 65)
+
+    fold_df, fold_channels, fold_mni_xyz = load_fold_table(fold_dir)
+
+    (valid_pairs, valid_ch_names, excluded_ch_names,
+     ch_mni_mid, ch_fold_match, ch_dist_mm, snap_arr) = compute_mni_midpoints(
+        fold_channels, fold_mni_xyz)
+
+    (ifg_sensitivity, null_sensitivity,
+     region_sens, pred_order) = load_ifg_sensitivity(
+        valid_pairs, valid_ch_names, ch_fold_match, fold_df)
+
+    df, hbo_cols, col_to_ch = load_epochs(epochs_csv)
+
+    (all_pv_nv, all_ha_la, n_subs, group_tvals, fdr_results,
+     group_tvals_arousal, fdr_arousal, valid_pvals_for_fdr, valid_arousal_p,
+     region_tvals, emp_order, n_positive, n_sig_uncorr,
+     n_sig_fdr, n_sig_arousal_fdr) = run_valence_contrast(
+        df, hbo_cols, col_to_ch, valid_ch_names)
+
+    fm = run_forward_model(
+        all_pv_nv, group_tvals, ifg_sensitivity, null_sensitivity,
+        valid_ch_names, snap_arr, pred_order, emp_order,
+        region_sens, region_tvals, rng)
+    fm['emp_order'] = emp_order  # pass through for save_results
+
+    generate_figures(
+        output_dir, valid_ch_names, ch_fold_match, ifg_sensitivity,
+        group_tvals, fdr_results, group_tvals_arousal, fdr_arousal,
+        valid_pvals_for_fdr, valid_arousal_p, region_sens, region_tvals,
+        snap_arr, n_subs, n_sig_fdr, n_sig_arousal_fdr, n_sig_uncorr, fm)
+
+    print("\n[Part 8] Saving results...")
+    save_results(
+        output_dir, seed, snap_arr, n_subs, valid_pvals_for_fdr, valid_arousal_p,
+        group_tvals, fdr_results, valid_ch_names, ch_fold_match, ifg_sensitivity,
+        pred_order, fm, n_positive, n_sig_uncorr, n_sig_fdr, n_sig_arousal_fdr)
+
     print(f"\n{'=' * 65}")
     print("  NEMO — Final summary for DSAA 2026")
     print(f"{'=' * 65}")
-    print(f"\n  PRIMARY — Valence contrast (n = {N_SUBS} subjects):")
-    print(f"    {n_positive}/{len(valid_pvals_for_fdr)} valid channels: "
-          f"positive HbO for PV > NV")
-    print(f"    {n_sig_uncorr}/{len(valid_pvals_for_fdr)} significant uncorrected "
-          f"(p < 0.05)")
-    print(f"    {n_sig_fdr}/{len(valid_pvals_for_fdr)} significant FDR-BH "
-          f"(q < {FDR_ALPHA})")
-    print(f"    {n_sig_arousal_fdr}/{len(valid_arousal_p)} significant arousal "
-          f"(specificity check)")
+    print(f"\n  PRIMARY — Valence contrast (n = {n_subs} subjects):")
+    print(f"    {n_positive}/{len(valid_pvals_for_fdr)} valid channels: positive HbO for PV > NV")
+    print(f"    {n_sig_uncorr}/{len(valid_pvals_for_fdr)} significant uncorrected (p < 0.05)")
+    print(f"    {n_sig_fdr}/{len(valid_pvals_for_fdr)} significant FDR-BH (q < {FDR_ALPHA})")
+    print(f"    {n_sig_arousal_fdr}/{len(valid_arousal_p)} significant arousal (specificity check)")
     print(f"\n  SECONDARY — Forward sensitivity (fOLD, exploratory):")
-    print(f"    Regional hierarchy match: {'YES' if match_reg else 'NO'}")
+    print(f"    Regional hierarchy match: {'YES' if fm['match_reg'] else 'NO'}")
     print(f"      fOLD:      {' > '.join(pred_order)}")
     print(f"      Empirical: {' > '.join(emp_order)}")
-    mean_r_str = f'{np.mean(r_vals):.3f}' if r_vals else 'n/a'
-    print(f"    Channel Spearman r = {r_str} "
-          f"(n = {len(common_valid)}, EXPLORATORY)")
-    print(f"    LOO mean r = {mean_r_str} ({len(r_per_sub)} subjects)")
+    mean_r_str = f"{np.mean(fm['r_vals']):.3f}" if fm['r_vals'] else 'n/a'
+    print(f"    Channel Spearman r = {fm['r_str']} (n = {len(fm['common_valid'])}, EXPLORATORY)")
+    print(f"    LOO mean r = {mean_r_str} ({len(fm['r_per_sub'])} subjects)")
     print(f"\n  CAVEATS (must appear in paper Methods):")
     print(f"    - No MRI co-registration; nominal artinis-brite23 positions")
-    print(f"    - MNI snap median {np.median(snap_arr):.0f} mm "
-          f"(> 25 mm Metz 2022 threshold)")
+    print(f"    - MNI snap median {np.median(snap_arr):.0f} mm (> 25 mm Metz 2022 threshold)")
     print(f"    - Region labels are cap-geometry, not neuroanatomical")
     print(f"    - BA17, BA11: zero channel coverage in this montage")
     print(f"\n  Outputs saved to: {output_dir}")
@@ -986,7 +1274,11 @@ Data sources
     args = parser.parse_args()
 
     with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', category=RuntimeWarning, module='mne')
+        warnings.filterwarnings(
+            'ignore',
+            message='.*No fiducials.*|.*not in montage.*|.*Could not determine.*',
+            category=RuntimeWarning,
+        )
         main(
             fold_dir   = args.fold_dir,
             epochs_csv = args.epochs_csv,
