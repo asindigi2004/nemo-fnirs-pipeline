@@ -162,8 +162,8 @@ pip install pytest
 python -m pytest tests/smoke_test.py -v
 ```
 
-Expected output: **23 passed, 4 skipped** on the original pipeline;
-**27 passed** on the refactored version.
+Expected output: **29 passed, 4 skipped** on the original pipeline;
+**33 passed** on the refactored version.
 
 The 4 skipped tests cover `mirror_detector_d8()`, which is only present
 in the refactored pipeline. All core statistical functions are covered
